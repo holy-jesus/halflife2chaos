@@ -2,21 +2,13 @@ import threading
 from collections import Counter
 from typing import Optional
 
-from twitchAPI.oauth import refresh_access_token
-from twitchAPI import Twitch
-from twitchAPI.oauth import UserAuthenticator
-from twitchAPI.types import AuthScope, ChatEvent, TwitchAPIException
-from twitchAPI.chat import Chat, EventData, ChatMessage
 # noinspection PyUnresolvedReferences
 import obspython as obs
 from rcon.source import rcon
 from rcon.exceptions import WrongPassword
 import asyncio
+from chat import Chat, Message
 
-APP_ID = ''
-APP_SECRET = ''
-USER_SCOPE = [AuthScope.CHAT_READ]
-REFRESH_TOKEN = ''
 TARGET_CHANNEL = ''
 SOURCE_NAME = ''
 RCON_HOST = "127.0.0.1"
@@ -30,19 +22,13 @@ voteEffects = []
 voteKeywords = []
 
 
-# this will be called when the event READY is triggered, which will be on bot start
-async def on_ready(ready_event: EventData):
-    print('Bot is ready for work, joining channels')
-    await ready_event.chat.join_room(TARGET_CHANNEL)
-
-
-async def on_message(msg: ChatMessage):
+def on_message(message: Message):
     global votes
-    print(f'in {msg.room.name}, {msg.user.name} said: {msg.text}')
+    print(f"in {message.room.name}, {message.user.name} said: {message.text}")
     uppercase_keywords = [kw.upper() for kw in voteKeywords]
-    if msg.text.upper() in uppercase_keywords:
-        votes[msg.user.id] = uppercase_keywords.index(msg.text.upper())
-
+    text = message.text.upper()
+    if text in uppercase_keywords:
+        votes[message.user.id] = uppercase_keywords.index(text)
 
 async def update_game_votes():
     global voteNumber, voteEffects, votes
@@ -54,7 +40,6 @@ async def update_game_votes():
         'chaos_vote_internal_set', str(voteNumber), *vote_params,
         host=RCON_HOST, port=int(RCON_PORT), passwd=RCON_PASSWORD
     )
-
 
 async def poll_game():
     global voteNumber, voteEffects, votes
@@ -104,48 +89,18 @@ async def game_loop():
             return
 
 
-chat: Optional[Chat] = None
-twitch: Optional[Twitch] = None
+twitch: Optional[Chat] = None
 poll_task: Optional[asyncio.Task] = None
 
 
 async def try_starting_twitch():
-    global chat, twitch, REFRESH_TOKEN
-    if APP_ID != "" and APP_SECRET != "" and twitch is None:
-        twitch = await Twitch(APP_ID, APP_SECRET)
-        token = None
-        if REFRESH_TOKEN != "":
-            print("refreshing token")
-            try:
-                token, REFRESH_TOKEN = await refresh_access_token(REFRESH_TOKEN, APP_ID, APP_SECRET)
-            except TwitchAPIException as e:
-                print("token refresh failed", e)
-        if token is None:
-            print("querying new token")
-            auth = UserAuthenticator(twitch, USER_SCOPE)
-            token, REFRESH_TOKEN = await auth.authenticate()
-        await twitch.set_user_authentication(token, USER_SCOPE, REFRESH_TOKEN)
-
-        chat = await Chat(twitch)
-        chat.register_event(ChatEvent.READY, on_ready)
-        chat.register_event(ChatEvent.MESSAGE, on_message)
-
-        # NOTE: this evil little library creates its own thread and loop.
-        # be careful inside its callbacks.
-        chat.start()
-        print("connection stuff done")
-    else:
-        print("didn't connect because of missing values or a programming error")
-
+    global twitch
+    twitch = Chat(channel=TARGET_CHANNEL, loop=_LOOP)
+    twitch.on_message(on_message)    
+    await twitch.start()
 
 async def shutdown_twitch():
-    global chat, twitch
-    if chat:
-        chat.stop()
-        chat = None
-    if twitch:
-        await twitch.close()
-        twitch = None
+    await twitch.close()
 
 
 async def startup():
@@ -160,7 +115,7 @@ async def startup():
 
 
 async def shutdown():
-    global chat, twitch, poll_task
+    global twitch, poll_task
     if poll_task:
         poll_task.cancel()
     await shutdown_twitch()
@@ -194,8 +149,6 @@ _THREAD: Optional[threading.Thread] = None
 
 def script_properties():
     props = obs.obs_properties_create()
-    obs.obs_properties_add_text(props, "app_id", "App id", obs.OBS_TEXT_DEFAULT)
-    obs.obs_properties_add_text(props, "app_secret", "App secret", obs.OBS_TEXT_PASSWORD)
     obs.obs_properties_add_text(props, "target_channel", "Target channel", obs.OBS_TEXT_DEFAULT)
 
     p = obs.obs_properties_add_list(props, "source", "Text Source", obs.OBS_COMBO_TYPE_EDITABLE,
@@ -226,7 +179,7 @@ def script_properties():
 
 
 def script_defaults(settings):
-    obs.obs_data_set_default_string(settings, "target_channel", "acuifex")
+    # obs.obs_data_set_default_string(settings, "target_channel", "acuifex")
     obs.obs_data_set_default_string(settings, "rcon_host", "127.0.0.1:27015")
 
     obs_array = obs.obs_data_array_create()
@@ -241,9 +194,7 @@ def script_defaults(settings):
 
 def script_update(settings):
     # i feel like i'm doing something wrong.
-    global voteKeywords, APP_ID, APP_SECRET, TARGET_CHANNEL, SOURCE_NAME, RCON_HOST, RCON_PORT, RCON_PASSWORD
-    APP_ID = obs.obs_data_get_string(settings, "app_id")
-    APP_SECRET = obs.obs_data_get_string(settings, "app_secret")
+    global voteKeywords, TARGET_CHANNEL, SOURCE_NAME, RCON_HOST, RCON_PORT, RCON_PASSWORD
     TARGET_CHANNEL = obs.obs_data_get_string(settings, "target_channel")
     SOURCE_NAME = obs.obs_data_get_string(settings, "source")
     # TODO: Verify port here. We may have an error if we don't
@@ -261,14 +212,10 @@ def script_update(settings):
     print("data updated")
 
 
-def script_save(settings):
-    obs.obs_data_set_string(settings, "refresh_token", REFRESH_TOKEN)
-
 # https://gist.github.com/serializingme/5c1a6fd6c7ea58af77c7b80579737c5a
 
 def script_load(settings):
-    global _LOOP, _THREAD, REFRESH_TOKEN
-    REFRESH_TOKEN = obs.obs_data_get_string(settings, "refresh_token")
+    global _LOOP, _THREAD
 
     # let's be nice, and only call the obs's methods from its own thread.
     # TODO: call this every frame because why not?
@@ -311,5 +258,5 @@ def script_unload():
 def script_description():
     return """Twitch chat voting plugin for HL2Chaos mod
     
-Made by acuifex
+Made by acuifex, modified by holy-jesus
 Released under AGPLv3 license"""
