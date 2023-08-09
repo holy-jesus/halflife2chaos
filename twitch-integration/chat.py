@@ -8,6 +8,7 @@ from websockets.exceptions import (
     ConnectionClosed,
     ConnectionClosedOK,
     ConnectionClosedError,
+    InvalidHandshake,
 )
 
 
@@ -42,18 +43,23 @@ class Chat:
         self._channel = channel
         self.loop = loop
 
-        self.ws: websockets.client.WebSocketClientProtocol = None
         self.connected = asyncio.Event()
         self.joined_channel = asyncio.Event()
+        self._channel_queue = asyncio.Queue()
 
+        self._backoff = 0
+
+        self.ws: websockets.client.WebSocketClientProtocol = None
         self._on_message = None
         self._thread_task: asyncio.Task = None
+        self._channel_task: asyncio.Task = None
         self._internal_events = {
             "PRIVMSG": self._privmsg,
             "PING": self._ping,
             "NOTICE": self._notice,
             "001": self._connected,
             "JOIN": self._join,
+            "RECONNECT": self._reconnect,
         }
 
     # Start
@@ -64,9 +70,18 @@ class Chat:
             if self.ws.open:
                 await self.ws.close()
             self.connected.clear()
-        self.ws = await websockets.client.connect(
-            "wss://irc-ws.chat.twitch.tv:443", ping_timeout=None, ping_interval=None
-        )
+        while True:
+            try:
+                self.ws = await websockets.client.connect(
+                    "wss://irc-ws.chat.twitch.tv:443", ping_timeout=None, ping_interval=None
+                )
+                break
+            except (OSError, TimeoutError, InvalidHandshake):
+                if not self.connected.is_set():
+                    print(f"Retrying connect in {self._backoff}...")
+                    await asyncio.sleep(self._backoff)
+                    self._backoff = min((self._backoff * 2) if self._backoff != 0 else 1, 60)
+                self.connected.clear()
         await self._send(
             "CAP REQ :twitch.tv/commands twitch.tv/membership twitch.tv/tags"
         )
@@ -89,7 +104,12 @@ class Chat:
                             continue
                         self.loop.create_task(self._process_event(event))
         finally:
+            if not self.connected.is_set():
+                print(f"Retrying connect in {self._backoff}...")
+                await asyncio.sleep(self._backoff)
+                self._backoff = min((self._backoff * 2) if self._backoff != 0 else 1, 60)
             self.connected.clear()
+            await self.start()
 
     async def _process_event(self, data: str) -> None:
         data = data.strip()
@@ -194,7 +214,7 @@ class Chat:
         ):
             event["command"] = command_parts[0]
             event["channel"] = command_parts[1].replace("#", "")
-        elif command_parts[0] in ("PING", "001"):
+        elif command_parts[0] in ("PING", "001", "RECONNECT"):
             event["command"] = command_parts[0]
 
     @staticmethod
@@ -216,11 +236,18 @@ class Chat:
 
     def _connected(self, _) -> None:
         print("Successfully connected to Twitch.")
+        self.connected.set()
+        self._backoff = 0
 
     def _join(self, parsed: dict) -> None:
         if "justinfan1337" == parsed["nick"] and self._channel == parsed["channel"]:
             print(f"Successfully joined {self._channel} channel.")
             self.joined_channel.set()
+
+    async def _reconnect(self, _) -> None:
+        await self.close()
+        await asyncio.sleep(2) # Just in case
+        await self.start()
 
     # User events
 
@@ -245,3 +272,26 @@ class Chat:
             self._thread_task.cancel()
         if self.ws.open:
             await self.ws.close()
+        self.connected.clear()
+        self.joined_channel.clear()
+
+    # Misc
+
+    def channel_update(self, channel: str):
+        if self._channel.lower() != channel.lower():
+            if not self._channel_task or self._channel_task.done():
+                self._channel_task = self.loop.create_task(self.channel_loop())
+            self._channel_queue.put_nowait(channel)
+
+    async def channel_loop(self):
+        try:
+            while True:
+                channel: str = await asyncio.wait_for(self._channel_queue.get(), 2)
+        except TimeoutError:
+            if channel and self._channel.lower() != channel.lower():
+                if self._channel and self.joined_channel.is_set():
+                    self.joined_channel.clear()
+                    print(f"Left from {self._channel} channel.")
+                    await self._send(f"PART #{self._channel}")
+                self._channel = channel
+                await self._send(f"JOIN #{channel}")

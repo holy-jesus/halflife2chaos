@@ -179,7 +179,6 @@ def script_properties():
 
 
 def script_defaults(settings):
-    # obs.obs_data_set_default_string(settings, "target_channel", "acuifex")
     obs.obs_data_set_default_string(settings, "rcon_host", "127.0.0.1:27015")
 
     obs_array = obs.obs_data_array_create()
@@ -196,6 +195,8 @@ def script_update(settings):
     # i feel like i'm doing something wrong.
     global voteKeywords, TARGET_CHANNEL, SOURCE_NAME, RCON_HOST, RCON_PORT, RCON_PASSWORD
     TARGET_CHANNEL = obs.obs_data_get_string(settings, "target_channel")
+    if twitch:
+        twitch.channel_update(TARGET_CHANNEL)
     SOURCE_NAME = obs.obs_data_get_string(settings, "source")
     # TODO: Verify port here. We may have an error if we don't
     RCON_HOST, RCON_PORT = obs.obs_data_get_string(settings, "rcon_host").split(":", 1)
